@@ -110,6 +110,9 @@ class MediaLibrary {
         add_filter( 'update_attached_file', [ $this, 'update_attached_file' ], 100, 2 ); 
 
         add_action( 'wpmcs_do_update_attachment_metadata', [ $this, 'update_attachment_metadata' ], 10, 2 );
+
+        // Hook for image editor saves (crop, rotate, scale, etc.)
+        add_filter( 'wp_save_image_editor_file', [ $this, 'handle_image_editor_save' ], 10, 5 );
     }
 
 
@@ -153,6 +156,22 @@ class MediaLibrary {
         return $file;
     }
 
+    /**
+     * Handle image editor saves (crop, rotate, scale, etc.)
+     * Forces re-upload of edited images to cloud storage.
+     */
+    public function handle_image_editor_save($override, $filename, $image, $mime_type, $post_id) {
+        // Schedule a sync after the image editor completes its save
+        // Use a flag to force re-upload of edited images
+        add_filter('wpmcs_do_reupload_media', function($do_reupload, $attachment_id, $source_type) use ($post_id) {
+            if ($attachment_id === $post_id) {
+                return true;
+            }
+            return $do_reupload;
+        }, 10, 3);
+
+        return $override;
+    }
 
     /**
      * Function to remove data from provider by attachment ID
@@ -197,6 +216,9 @@ class MediaLibrary {
             if (!Utils::is_ok_to_upload($attachment_id) || is_wp_error($attachment_meta)) {
                 return $attachment_meta;
             }
+
+            // Clean up stale sizes from edited images
+            $attachment_meta = $this->cleanup_stale_sizes($attachment_meta, $attachment_id);
 
             $attachment_id = (int) $attachment_id;
             $is_image = wp_attachment_is_image($attachment_id);
@@ -251,6 +273,13 @@ class MediaLibrary {
             return true;
         }
 
+        // Don't wait for subsizes on existing images - only on fresh uploads.
+        // Check if attachment was created more than 60 seconds ago.
+        $post = get_post($attachment_id);
+        if ($post && (time() - strtotime($post->post_date_gmt)) > 60) {
+            return false;
+        }
+
         // Check if there are any missing image subsizes.
         $image_sizes = apply_filters(
             'intermediate_image_sizes_advanced',
@@ -302,6 +331,40 @@ class MediaLibrary {
             $file = Utils::get_post_meta($attachment_id, '_wp_attached_file', true);
         }
         return $file;
+    }
+
+    /**
+     * Clean up stale image sizes that reference the original file after an edit.
+     * WordPress only regenerates sizes smaller than the edited image dimensions,
+     * leaving larger sizes pointing to the original file.
+     */
+    private function cleanup_stale_sizes($attachment_meta, $attachment_id) {
+        if (empty($attachment_meta['file']) || empty($attachment_meta['sizes'])) {
+            return $attachment_meta;
+        }
+
+        $main_file = $attachment_meta['file'];
+        
+        // Check if this is an edited image (has -e timestamp)
+        if (preg_match('/-e\d+\./', $main_file)) {
+            $main_basename = pathinfo(basename($main_file), PATHINFO_FILENAME);
+            $cleaned_sizes = [];
+            
+            foreach ($attachment_meta['sizes'] as $size => $data) {
+                $size_basename = pathinfo($data['file'], PATHINFO_FILENAME);
+                // Keep sizes that start with the edited filename base
+                if (strpos($size_basename, $main_basename) === 0) {
+                    $cleaned_sizes[$size] = $data;
+                }
+            }
+            
+            if (count($cleaned_sizes) !== count($attachment_meta['sizes'])) {
+                $attachment_meta['sizes'] = $cleaned_sizes;
+                wp_update_attachment_metadata($attachment_id, $attachment_meta);
+            }
+        }
+        
+        return $attachment_meta;
     }
 
     /**
@@ -376,7 +439,7 @@ class MediaLibrary {
                     'original_source_path'  => $backup['original_source_path'],
                     'original_key'          => $backup['original_key'],
                 ],
-                'extra' => Utilsmaybe_unserialize($backup['extra']),
+                'extra' => Utils::maybe_unserialize($backup['extra']),
             ];
         }
 
@@ -820,6 +883,19 @@ class MediaLibrary {
 		if (!Utils::is_ok_to_serve($attachment->ID)) {
             return $response;
         }
+
+		// Clean up stale sizes for edited images before preparing JS response
+		if ( isset( $response['sizes'] ) && is_array( $response['sizes'] ) && !empty($meta['file']) ) {
+			if (preg_match('/-e\d+\./', $meta['file'])) {
+				$main_basename = pathinfo(basename($meta['file']), PATHINFO_FILENAME);
+				foreach ( $response['sizes'] as $size => $value ) {
+					$size_basename = pathinfo($value['file'] ?? '', PATHINFO_FILENAME);
+					if (!empty($size_basename) && strpos($size_basename, $main_basename) !== 0) {
+						unset($response['sizes'][$size]);
+					}
+				}
+			}
+		}
 
 		if ( isset( $response['sizes'] ) && is_array( $response['sizes'] ) ) {
 			foreach ( $response['sizes'] as $size => $value ) {
