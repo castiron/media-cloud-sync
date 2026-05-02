@@ -151,9 +151,65 @@ class MediaLibrary {
             return $file;
         }
 
+        // WP can call update_attached_file() with a path it computed from the URL
+        // we returned via the get_attached_file filter (e.g. inside wp_save_image,
+        // where $new_path = dirname(<S3 URL>) . "/{$filename}-e{$suffix}.{$ext}").
+        // Persisting that URL into _wp_attached_file post meta poisons every
+        // subsequent get_attached_file() call. Normalize back to a relative
+        // upload path before letting it through.
+        $file = $this->normalize_attached_file_value($file);
+
         $file = apply_filters('wpmcs_update_attached_file', $file, $attachment_id, $item);
 
         return $file;
+    }
+
+    /**
+     * Recover a relative upload path from an attached_file value that may be a
+     * URL (or contain an embedded URL after a prior corrupted save).
+     *
+     * Returns the input unchanged when no URL is present so local paths fall
+     * through to WordPress's own _wp_relative_upload_path() handling.
+     *
+     * @param string $file
+     * @return string
+     */
+    private function normalize_attached_file_value($file) {
+        if (!is_string($file) || $file === '') {
+            return $file;
+        }
+
+        $url_pos = strpos($file, 'https://');
+        if ($url_pos === false) {
+            $url_pos = strpos($file, 'http://');
+        }
+        if ($url_pos === false) {
+            return $file;
+        }
+
+        // Trim any junk prefix from a value like "/var/www/.../uploads/https://..."
+        $url = substr($file, $url_pos);
+
+        $parsed = wp_parse_url($url);
+        $path   = isset($parsed['path']) ? ltrim($parsed['path'], '/') : '';
+        if ($path === '') {
+            return $file;
+        }
+
+        // Strip everything up to and including base_path/ (e.g. "app/uploads/")
+        // so the result is the WP relative path (relative to uploads basedir).
+        // Path-style URLs include the bucket name as a leading segment, which
+        // this also drops.
+        $base_path = trim((string) Utils::get_settings('base_path', ''), '/');
+        if (Utils::get_settings('enable_base_path', true) && $base_path !== '') {
+            $needle = $base_path . '/';
+            $pos    = strpos($path, $needle);
+            if ($pos !== false) {
+                $path = substr($path, $pos + strlen($needle));
+            }
+        }
+
+        return $path !== '' ? $path : $file;
     }
 
     /**
