@@ -154,14 +154,34 @@ class MediaLibrary {
         // WP can call update_attached_file() with a path it computed from the URL
         // we returned via the get_attached_file filter (e.g. inside wp_save_image,
         // where $new_path = dirname(<S3 URL>) . "/{$filename}-e{$suffix}.{$ext}").
-        // Persisting that URL into _wp_attached_file post meta poisons every
-        // subsequent get_attached_file() call. Normalize back to a relative
-        // upload path before letting it through.
-        $file = $this->normalize_attached_file_value($file);
+        // file_put_contents() can't write to an HTTPS URL, so when this happens
+        // the save has already failed — letting the new value land would just
+        // advance post meta to a phantom filename and drift it out of sync with
+        // the items table, breaking every subsequent get_attached_file() call.
+        // Refuse the update entirely (return current meta), or self-heal if the
+        // current meta is itself corrupted.
+        if ($this->looks_like_url_value($file)) {
+            $current = get_post_meta($attachment_id, '_wp_attached_file', true);
+            if (!empty($current) && !$this->looks_like_url_value($current)) {
+                return $current;
+            }
+            return $this->normalize_attached_file_value($file);
+        }
 
         $file = apply_filters('wpmcs_update_attached_file', $file, $attachment_id, $item);
 
         return $file;
+    }
+
+    /**
+     * True if the value contains an http:// or https:// substring anywhere.
+     * Catches both pure URLs and corrupted paths like "/var/www/.../https://...".
+     */
+    private function looks_like_url_value($file) {
+        if (!is_string($file) || $file === '') {
+            return false;
+        }
+        return strpos($file, 'https://') !== false || strpos($file, 'http://') !== false;
     }
 
     /**
